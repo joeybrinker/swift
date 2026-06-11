@@ -959,7 +959,7 @@ static ModuleDecl *getModuleContextForNameLookupForCxxDecl(const Decl *decl) {
     return nullptr;
   }
 
-  auto clangModule = clangImporter->getClangOwningModule(decl->getClangDecl());
+  auto clangModule = clangImporter->getClangOwningModule(decl->getClangNode());
   if (!clangModule)
     return nullptr;
 
@@ -1220,6 +1220,11 @@ bool Decl::hasExplicitIsolationAttribute() const {
     if (!isolatedAttr->isImplicit()) {
       return true;
     }
+  }
+
+  if (auto concurrentAttr = getAttrs().getAttribute<ConcurrentAttr>()) {
+    if (!concurrentAttr->isImplicit())
+      return true;
   }
 
   if (auto globalActorAttr = getGlobalActorAttr()) {
@@ -6785,7 +6790,10 @@ void NominalTypeDecl::synthesizeSemanticMembersIfNeeded(DeclName member) {
 
   if (member.isSimpleName() && !baseName.isSpecial()) {
     if (baseName.getIdentifier() == Context.Id_CodingKeys) {
-      action.emplace(ImplicitMemberAction::ResolveCodingKeys);
+      // Only request CodingKeys synthesis if no explicit CodingKeys exists.
+      // lookupDirect does not trigger synthesis, so this is safe from cycles.
+      if (lookupDirect(DeclName(Context.Id_CodingKeys)).empty())
+        action.emplace(ImplicitMemberAction::ResolveCodingKeys);
     }
   } else {
     auto argumentNames = member.getArgumentNames();
@@ -12632,6 +12640,18 @@ ActorIsolation swift::getActorIsolationOfContext(
   }
 
   if (auto *init = dyn_cast<Initializer>(dcToUse)) {
+    // The initializer of a 'lazy' stored property is emitted into the property's
+    // synthesized getter, which is isolated to the property. So unlike an
+    // ordinary stored-property default value -- whose required isolation is
+    // computed and validated separately, and which is reported as unspecified
+    // here -- the lazy initializer, and any closures within it, run with the
+    // lazy variable's actor isolation and should inherit it.
+    if (auto *pbi = dyn_cast<PatternBindingInitializer>(init)) {
+      if (auto *lazyVar = pbi->getInitializedLazyVar()) {
+        return getActorIsolation(lazyVar);
+      }
+    }
+
     // FIXME: force default argument initializers to report a meaningless
     // isolation in order to break a bunch of cycles with the way that
     // isolation is computed for them.
@@ -13528,6 +13548,7 @@ MacroDiscriminatorContext MacroDiscriminatorContext::getParentOf(
   case GeneratedSourceInfo::ReplacedFunctionBody:
   case GeneratedSourceInfo::DefaultArgument:
   case GeneratedSourceInfo::AttributeFromClang:
+  case GeneratedSourceInfo::SyntheticMacro:
     return origDC;
   }
 }

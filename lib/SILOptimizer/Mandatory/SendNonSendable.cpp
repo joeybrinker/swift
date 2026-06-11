@@ -262,7 +262,7 @@ static SourceLoc preciseSourceLocForValue(SILValue value) {
 /// Emit a per-value note describing one side of an incompatible region merge.
 /// \p ownIso is the isolation of \p value (the textual rendering used when the
 /// value is *not* task-isolated). \p ownIsTaskIsolated drives a `%select` that
-/// renders "code in the current task" instead of "X-isolated code" for the
+/// renders "code in the current isolation context" instead of "X-isolated code" for the
 /// task-isolated case, matching the wording used elsewhere in the diagnostic
 /// suite.
 ///
@@ -464,12 +464,14 @@ static InFlightDiagnostic diagnoseNote(const PartitionOp &op, Diag<T...> diag,
 //               MARK: Unknown Pattern Error Helper
 //===----------------------------------------------------------------------===//
 
-// Helper to emit unknown pattern errors with diagnostic context
+// Helper to emit unknown pattern errors with diagnostic context.
 static void
 emitUnknownPatternErrorHelper(const char *emitterName, SILInstruction *inst,
                               std::optional<DiagnosticBehavior> behaviorLimit,
-                              const char *file, int line) {
-  if (inst->getFunction()->getModule().getOptions()
+                              bool pushToFuture, const char *file, int line) {
+  if (inst->getFunction()
+          ->getModule()
+          .getOptions()
           .AbortOnUnknownRegionIsolationPatternError) {
     llvm::report_fatal_error(
         "RegionIsolation: Found unknown SIL pattern in diagnostic emitter. "
@@ -477,11 +479,31 @@ emitUnknownPatternErrorHelper(const char *emitterName, SILInstruction *inst,
   }
 
   REGIONBASEDISOLATION_LOG(llvm::dbgs()
-                           << "Emitting Error. DiagnosticEmission Error: "
-                              "Unknown Code Pattern.\n"
+                           << "Emitting "
+                           << (pushToFuture ? "Warning (pushed to future). "
+                                            : "Error. ")
+                           << "DiagnosticEmission "
+                           << (pushToFuture ? "Warning" : "Error")
+                           << ": Unknown Code Pattern.\n"
                            << "  Emitter: " << emitterName << "\n"
                            << "  Instruction: " << *inst
                            << "  Location: " << file << ":" << line << "\n");
+
+  if (pushToFuture) {
+    // Bypass the file-scope `siloptimizer::diagnoseError` (which wraps in
+    // `warnUntilLanguageMode(v6)`) and emit directly with
+    // `warnUntilLanguageMode(future)` so this becomes a real warning even
+    // under `-swift-version 6`. Matches the IncompatibleRegionMergeErrorEmitter
+    // convention.
+    inst->getFunction()
+        ->getASTContext()
+        .Diags
+        .diagnose(inst->getLoc().getSourceLoc(),
+                  diag::regionbasedisolation_unknown_pattern)
+        .warnUntilLanguageMode(LanguageMode::future)
+        .limitBehaviorIf(behaviorLimit);
+    return;
+  }
 
   diagnoseError(inst, diag::regionbasedisolation_unknown_pattern)
       .limitBehaviorIf(behaviorLimit);
@@ -491,9 +513,10 @@ emitUnknownPatternErrorHelper(const char *emitterName, SILInstruction *inst,
 #error "EMIT_UNKNOWN_PATTERN_ERROR macro is already defined"
 #endif
 
-#define EMIT_UNKNOWN_PATTERN_ERROR(emitterName, inst, behaviorLimit)           \
-  emitUnknownPatternErrorHelper(#emitterName, inst, behaviorLimit, __FILE__,   \
-                                __LINE__)
+#define EMIT_UNKNOWN_PATTERN_ERROR(emitterName, inst, behaviorLimit,           \
+                                   pushToFuture)                               \
+  emitUnknownPatternErrorHelper(#emitterName, inst, behaviorLimit,             \
+                                pushToFuture, __FILE__, __LINE__)
 
 //===----------------------------------------------------------------------===//
 //                           MARK: Require Liveness
@@ -973,6 +996,24 @@ public:
   SILFunction *getFunction() const { return sendingOp->getFunction(); }
 
   std::optional<DiagnosticBehavior> getBehaviorLimit() const {
+    // If the apply that performed the send is preconcurrency on either side
+    // of its isolation crossing, downgrade to a warning. This mirrors the
+    // AST-level ActorIsolatedCall policy in TypeCheckConcurrency.cpp (search
+    // for `actor_isolated_call`): both diagnostics observe the same
+    // isolation crossing on the same ApplyExpr, so they should observe the
+    // same severity policy. Read the crossing from the AST ApplyExpr —
+    // SILGen does not propagate it onto the SIL apply for synchronous
+    // direct calls, so `ApplySite::getIsolationCrossing()` is typically
+    // empty here.
+    if (auto *applyExpr =
+            sendingOp->getUser()->getLoc().getAsASTNode<ApplyExpr>()) {
+      if (auto crossing = applyExpr->getIsolationCrossing()) {
+        if (crossing->getCallerIsolation().preconcurrency() ||
+            crossing->getCalleeIsolation().preconcurrency())
+          return DiagnosticBehavior::Warning;
+      }
+    }
+
     return sendingOp->get()->getType().getConcurrencyDiagnosticBehavior(
         getFunction());
   }
@@ -1000,7 +1041,8 @@ public:
         SILIsolationInfo::printActorIsolationForDiagnostics(
             getFunction(), isolationCrossing.getCallerIsolation());
 
-    bool isDisconnected = namedValuesIsolationInfo.isDisconnected();
+    bool isDisconnected = namedValuesIsolationInfo.isDisconnected() ||
+                          namedValuesIsolationInfo.isTaskIsolated();
     if (auto callee = getSendingCallee()) {
       diagnoseNote(
           loc, diag::regionbasedisolation_named_info_send_yields_race_callee,
@@ -1032,7 +1074,8 @@ public:
     auto callerIsolationStr =
         SILIsolationInfo::printActorIsolationForDiagnostics(
             getFunction(), isolationCrossing.getCallerIsolation());
-    bool isDisconnected = namedValuesIsolationInfo.isDisconnected();
+    bool isDisconnected = namedValuesIsolationInfo.isDisconnected() ||
+                          namedValuesIsolationInfo.isTaskIsolated();
 
     diagnoseNote(loc,
                  diag::regionbasedisolation_named_info_send_yields_race_callee,
@@ -1212,11 +1255,13 @@ public:
     auto callerIsolationStr =
         SILIsolationInfo::printActorIsolationForDiagnostics(
             getFunction(), isolationCrossing.getCallerIsolation());
-    bool isDisconnected = namedValuesIsolationInfo.isDisconnected();
+    bool isDisconnected = namedValuesIsolationInfo.isDisconnected() ||
+                          namedValuesIsolationInfo.isTaskIsolated();
+    bool isTaskIsolated = namedValuesIsolationInfo.isTaskIsolated();
     diagnoseNote(loc,
                  diag::regionbasedisolation_named_isolated_closure_yields_race,
                  isDisconnected, descriptiveKindStr, name, calleeIsolationStr,
-                 callerIsolationStr);
+                 callerIsolationStr, isTaskIsolated);
     emitRequireInstDiagnostics();
   }
 
@@ -1242,7 +1287,8 @@ public:
 
   void emitUnknownPatternError() {
     EMIT_UNKNOWN_PATTERN_ERROR(UseAfterSendDiagnosticEmitter,
-                               sendingOp->getUser(), getBehaviorLimit());
+                               sendingOp->getUser(), getBehaviorLimit(),
+                               /*pushToFuture=*/false);
   }
 
 private:
@@ -1697,7 +1743,8 @@ void SendNonSendableImpl::emitUseAfterSendDiagnostics() {
           sendingOp->get()->getType().getConcurrencyDiagnosticBehavior(
               function);
       EMIT_UNKNOWN_PATTERN_ERROR(emitUseAfterSendDiagnostics,
-                                 sendingOp->getUser(), behaviorLimit);
+                                 sendingOp->getUser(), behaviorLimit,
+                                 /*pushToFuture=*/false);
       continue;
     }
 
@@ -1779,6 +1826,33 @@ public:
     return neverSent.dyn_cast<SILInstruction *>();
   }
 
+  /// Return Warning iff the consuming apply's `ApplyExpr` isolation
+  /// crossing is preconcurrency on either side.
+  ///
+  /// Mirrors the AST-level ActorIsolatedCall policy in
+  /// TypeCheckConcurrency.cpp (search for `actor_isolated_call`): when
+  /// the SIL pass and the AST diagnostic observe the same crossing,
+  /// their severity decisions must agree.
+  ///
+  /// Read the crossing from the AST `ApplyExpr` rather than the SIL
+  /// apply — SILGen does not propagate it onto SIL apply instructions
+  /// for synchronous direct calls, so
+  /// `ApplySite::getIsolationCrossing()` is typically empty here.
+  std::optional<DiagnosticBehavior>
+  getApplyPreconcurrencyBehaviorLimit() const {
+    auto *applyExpr =
+        sendingOperand->getUser()->getLoc().getAsASTNode<ApplyExpr>();
+    if (!applyExpr)
+      return {};
+    auto crossing = applyExpr->getIsolationCrossing();
+    if (!crossing)
+      return {};
+    if (crossing->getCallerIsolation().preconcurrency() ||
+        crossing->getCalleeIsolation().preconcurrency())
+      return DiagnosticBehavior::Warning;
+    return {};
+  }
+
   std::optional<DiagnosticBehavior> getBehaviorLimit() const {
     // If the failure is due to an isolated conformance, downgrade the error
     // to a warning prior to Swift 7.
@@ -1789,6 +1863,9 @@ public:
              ->getASTContext()
              .isLanguageModeAtLeast(LanguageMode::future))
       return DiagnosticBehavior::Warning;
+
+    if (auto limit = getApplyPreconcurrencyBehaviorLimit())
+      return limit;
 
     return sendingOperand->get()->getType().getConcurrencyDiagnosticBehavior(
         getOperand()->getFunction());
@@ -1809,7 +1886,8 @@ public:
   void emitUnknownPatternError() {
     emittedErrorDiagnostic = true;
     EMIT_UNKNOWN_PATTERN_ERROR(SendNeverSentDiagnosticEmitter,
-                               getOperand()->getUser(), getBehaviorLimit());
+                               getOperand()->getUser(), getBehaviorLimit(),
+                               /*pushToFuture=*/false);
   }
 
   void emitUnknownUse(SILLocation loc) {
@@ -1834,11 +1912,13 @@ public:
       diagnoseNote(
           loc,
           diag::regionbasedisolation_typed_sendneversendable_via_arg_callee,
-          descriptiveKindStr, inferredType, calleeIsolationStr, callee.value());
+          descriptiveKindStr, inferredType, calleeIsolationStr, callee.value(),
+          getIsolationRegionInfo()->isTaskIsolated());
     } else {
       diagnoseNote(loc,
                    diag::regionbasedisolation_typed_sendneversendable_via_arg,
-                   descriptiveKindStr, inferredType, calleeIsolationStr);
+                   descriptiveKindStr, inferredType, calleeIsolationStr,
+                   getIsolationRegionInfo()->isTaskIsolated());
     }
   }
 
@@ -1854,11 +1934,13 @@ public:
     auto callerIsolationStr =
         SILIsolationInfo::printActorIsolationForDiagnostics(
             getFunction(), crossing.getCallerIsolation());
-    bool isDisconnected = getIsolationRegionInfo().isDisconnected();
+    bool isDisconnected = getIsolationRegionInfo().isDisconnected() ||
+                          getIsolationRegionInfo()->isTaskIsolated();
+    bool isTaskIsolated = getIsolationRegionInfo()->isTaskIsolated();
     diagnoseNote(loc,
                  diag::regionbasedisolation_named_isolated_closure_yields_race,
                  isDisconnected, descriptiveKindStr, name, calleeIsolationStr,
-                 callerIsolationStr);
+                 callerIsolationStr, isTaskIsolated);
   }
 
   void
@@ -2049,7 +2131,8 @@ public:
         getIsolationRegionInfo().printForDiagnostics(getFunction());
 
     diagnoseNote(loc, diag::regionbasedisolation_named_send_nt_asynclet_capture,
-                 name, descriptiveKindStr);
+                 name, descriptiveKindStr,
+                 getIsolationRegionInfo()->isTaskIsolated());
   }
 
   void emitNamedIsolation(SILLocation loc, Identifier name,
@@ -2061,17 +2144,19 @@ public:
     auto calleeIsolationStr =
         SILIsolationInfo::printActorIsolationForDiagnostics(
             getFunction(), isolationCrossing.getCalleeIsolation());
-    bool isDisconnected = getIsolationRegionInfo().isDisconnected();
+    bool isDisconnected = getIsolationRegionInfo().isDisconnected() ||
+                          getIsolationRegionInfo()->isTaskIsolated();
+    bool isTaskIsolated = getIsolationRegionInfo()->isTaskIsolated();
 
     if (auto callee = getSendingCallee()) {
       diagnoseNote(loc,
                    diag::regionbasedisolation_named_send_never_sendable_callee,
                    isDisconnected, name, descriptiveKindStr, calleeIsolationStr,
-                   callee.value(), descriptiveKindStr);
+                   callee.value(), descriptiveKindStr, isTaskIsolated);
     } else {
       diagnoseNote(loc, diag::regionbasedisolation_named_send_never_sendable,
                    isDisconnected, name, descriptiveKindStr, calleeIsolationStr,
-                   descriptiveKindStr);
+                   descriptiveKindStr, isTaskIsolated);
     }
   }
 
@@ -2081,19 +2166,24 @@ public:
 
     auto descriptiveKindStr =
         getIsolationRegionInfo().printForDiagnostics(getFunction());
-    bool isDisconnected = getIsolationRegionInfo().isDisconnected();
+    bool isTaskIsolated = getIsolationRegionInfo()->isTaskIsolated();
+    bool isDisconnected = getIsolationRegionInfo().isDisconnected() ||
+                          isTaskIsolated;
     auto diag = diag::regionbasedisolation_named_send_into_sending_param;
-    diagnoseNote(loc, diag, isDisconnected, descriptiveKindStr, varName);
+    diagnoseNote(loc, diag, isDisconnected, descriptiveKindStr, varName,
+                 isTaskIsolated);
   }
 
   void emitNamedSendingReturn(SILLocation loc, Identifier varName) {
     emitNamedOnlyError(loc, varName);
     auto descriptiveKindStr =
         getIsolationRegionInfo().printForDiagnostics(getFunction());
-    bool isDisconnected = getIsolationRegionInfo().isDisconnected();
+    bool isTaskIsolated = getIsolationRegionInfo()->isTaskIsolated();
+    bool isDisconnected = getIsolationRegionInfo().isDisconnected() ||
+                          isTaskIsolated;
     auto diag = diag::regionbasedisolation_named_nosend_send_into_result;
     diagnoseNote(loc, diag, isDisconnected, descriptiveKindStr, varName,
-                 descriptiveKindStr);
+                 descriptiveKindStr, isTaskIsolated);
   }
 
 private:
@@ -2639,10 +2729,11 @@ public:
         getFunction());
   }
 
-  void emitUnknownPatternError() {
+  void emitUnknownPatternError(bool pushToFuture = false) {
     emittedErrorDiagnostic = true;
     EMIT_UNKNOWN_PATTERN_ERROR(InOutSendingReturnedDiagnosticEmitter,
-                               functionExitingInst, getBehaviorLimit());
+                               functionExitingInst, getBehaviorLimit(),
+                               pushToFuture);
   }
 
   void emit();
@@ -2688,7 +2779,8 @@ public:
 
     std::optional<Identifier> erroringEltName = inferNameHelper(value);
     if (!erroringEltName) {
-      return emitUnknownPatternError();
+      // We could not infer a name for the returned value.
+      return emitUnknownPatternError(/*pushToFuture=*/downgradeToWarning);
     }
 
     diagnoseError(
@@ -3281,7 +3373,8 @@ public:
 
   void emitUnknownPatternError() {
     EMIT_UNKNOWN_PATTERN_ERROR(InOutSendingNotDisconnectedDiagnosticEmitter,
-                               functionExitingInst, getBehaviorLimit());
+                               functionExitingInst, getBehaviorLimit(),
+                               /*pushToFuture=*/false);
   }
 
   void emit();
@@ -3346,13 +3439,15 @@ void InOutSendingNotDisconnectedAtExitDiagnosticEmitter::emit() {
   diagnoseError(
       functionExitingInst,
       diag::regionbasedisolation_inout_sending_cannot_be_actor_isolated,
-      *varName, descriptiveKindStr)
+      *varName, descriptiveKindStr,
+      actorIsolatedRegionInfo->isTaskIsolated())
       .limitBehaviorIf(getBehaviorLimit());
 
   diagnoseNote(
       functionExitingInst,
       diag::regionbasedisolation_inout_sending_cannot_be_actor_isolated_note,
-      *varName, descriptiveKindStr);
+      *varName, descriptiveKindStr,
+      actorIsolatedRegionInfo->isTaskIsolated());
 }
 
 //===----------------------------------------------------------------------===//
@@ -3419,7 +3514,8 @@ public:
   void emitUnknownPatternError() {
     EMIT_UNKNOWN_PATTERN_ERROR(AssignIsolatedIntoSendingResultDiagnosticEmitter,
                                srcOperand->getUser(),
-                               getConcurrencyDiagnosticBehavior());
+                               getConcurrencyDiagnosticBehavior(),
+                               /*pushToFuture=*/false);
   }
 
   void emit();
@@ -3505,6 +3601,7 @@ void AssignNeverSendableIntoSendingResultDiagnosticEmitter::emit() {
   // Then emit the note with greater context.
   auto descriptiveKindStr =
       isolatedValueIsolationRegionInfo.printForDiagnostics(getFunction());
+  bool isTaskIsolated = isolatedValueIsolationRegionInfo->isTaskIsolated();
 
   // Grab the var name if we can find it.
   if (auto varName = VariableNameInferrer::inferName(srcOperand->get())) {
@@ -3550,14 +3647,14 @@ void AssignNeverSendableIntoSendingResultDiagnosticEmitter::emit() {
     diagnoseError(
         srcOperand,
         diag::regionbasedisolation_out_sending_cannot_be_actor_isolated_named,
-        *varName, descriptiveKindStr)
+        *varName, descriptiveKindStr, isTaskIsolated)
         .limitBehaviorIf(getConcurrencyDiagnosticBehavior());
 
     diagnoseNote(
         srcOperand,
         diag::
             regionbasedisolation_out_sending_cannot_be_actor_isolated_note_named,
-        *varName, descriptiveKindStr);
+        *varName, descriptiveKindStr, isTaskIsolated);
     return;
   }
 
@@ -3566,13 +3663,13 @@ void AssignNeverSendableIntoSendingResultDiagnosticEmitter::emit() {
   diagnoseError(
       srcOperand,
       diag::regionbasedisolation_out_sending_cannot_be_actor_isolated_type,
-      type, descriptiveKindStr)
+      type, descriptiveKindStr, isTaskIsolated)
       .limitBehaviorIf(getConcurrencyDiagnosticBehavior());
 
   diagnoseNote(
       srcOperand,
       diag::regionbasedisolation_out_sending_cannot_be_actor_isolated_note_type,
-      type, descriptiveKindStr);
+      type, descriptiveKindStr, isTaskIsolated);
   diagnoseNote(srcOperand, diag::regionbasedisolation_type_is_non_sendable,
                type);
 }
@@ -3698,7 +3795,8 @@ struct NonSendableIsolationCrossingResultDiagnosticEmitter {
     emittedErrorDiagnostic = true;
     EMIT_UNKNOWN_PATTERN_ERROR(
         NonSendableIsolationCrossingResultDiagnosticEmitter,
-        error.op->getSourceInst(), getBehaviorLimit());
+        error.op->getSourceInst(), getBehaviorLimit(),
+        /*pushToFuture=*/false);
   }
 
   Type getType() const {
@@ -3876,7 +3974,8 @@ public:
   void emitUnknownPatternError() {
     EMIT_UNKNOWN_PATTERN_ERROR(
         InOutSendingParametersInSameRegionDiagnosticEmitter,
-        functionExitingInst, getBehaviorLimit());
+        functionExitingInst, getBehaviorLimit(),
+        /*pushToFuture=*/false);
   }
 
   void emit();
@@ -4021,7 +4120,8 @@ struct IncompatibleRegionMergeDiagnosticEmitter {
 private:
   void emitUnknownPatternError() {
     EMIT_UNKNOWN_PATTERN_ERROR(IncompatibleRegionMergeErrorEmitter,
-                               op->getUser(), getBehaviorLimit());
+                               op->getUser(), getBehaviorLimit(),
+                               /*pushToFuture=*/true);
   }
 
   // Emit incompatible-region-merge diagnostics as warnings until the future

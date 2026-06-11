@@ -953,9 +953,7 @@ std::string ASTMangler::mangleObjCRuntimeName(const NominalTypeDecl *Nominal) {
   Node *NewGlobal = Dem.createNode(Node::Kind::Global);
   NewGlobal->addChild(TyMangling, Dem);
   auto mangling = mangleNodeOld(NewGlobal);
-  if (!mangling.isSuccess()) {
-    llvm_unreachable("unexpected mangling failure");
-  }
+  ASSERT(mangling.isSuccess());
   return mangling.result();
 #endif
 }
@@ -4478,7 +4476,17 @@ ASTMangler::appendProtocolConformance(const ProtocolConformance *conformance) {
       conformance->getDeclContext()->getModuleScopeContext();
   Mod = topLevelSubcontext->getParentModule();
 
-  auto conformingType = conformance->getType();
+  Type conformingType;
+  if (isa<NormalProtocolConformance>(conformance) &&
+      conformance->isReparented()) {
+    // Note: The conforming type of a reparented conformance used to be the
+    // protocol, but that interacted badly with type substitution. Instead
+    // we set the conforming type to be the Self type parameter, but that
+    // requires a special case here to maintain the previous mangling.
+    conformingType = conformance->getDeclContext()->getDeclaredInterfaceType();
+  } else {
+    conformingType = conformance->getType();
+  }
   appendType(conformingType->getCanonicalType(), nullptr);
 
   appendProtocolName(conformance->getProtocol());
@@ -4991,6 +4999,7 @@ void ASTMangler::appendMacroExpansionContext(
   case GeneratedSourceInfo::ReplacedFunctionBody:
   case GeneratedSourceInfo::DefaultArgument:
   case GeneratedSourceInfo::AttributeFromClang:
+  case GeneratedSourceInfo::SyntheticMacro:
     return appendMacroExpansionLoc();
   }
   
@@ -5043,6 +5052,7 @@ void ASTMangler::appendMacroExpansionContext(
   case GeneratedSourceInfo::ReplacedFunctionBody:
   case GeneratedSourceInfo::DefaultArgument:
   case GeneratedSourceInfo::AttributeFromClang:
+  case GeneratedSourceInfo::SyntheticMacro:
     llvm_unreachable("Exited above");
   }
 

@@ -45,10 +45,12 @@ Or upgrade all warnings except deprecated declaration to errors:
 - <doc:isolated-conformances>
 - <doc:error-in-future-swift-version>
 - <doc:old-suppressed-associatedtypes>
+- <doc:canimport-missing-module>
 - <doc:module-version-missing>
 - <doc:module-self-import>
 - <doc:oslog>
 - <doc:option-obsoleted-by-module-selectors>
+- <doc:public-import-of-project-internal-module>
 - <doc:result-builder-methods>
 - <doc:spi-import-ignored>
 - <doc:semantic-copies>
@@ -57,6 +59,7 @@ Or upgrade all warnings except deprecated declaration to errors:
 - <doc:unavailable-sendable-conformance>
 - <doc:unknown-warning-group>
 - <doc:unnecessary-effect-marker>
+- <doc:unnecessary-unsafe>
 - <doc:unsupported-scoped-import>
 - <doc:untyped-throws>
 - <doc:unused-import-access>
@@ -94,6 +97,7 @@ Or upgrade all warnings except deprecated declaration to errors:
 - <doc:isolated-conformances>
 - <doc:error-in-future-swift-version>
 - <doc:old-suppressed-associatedtypes>
+- <doc:canimport-missing-module>
 - <doc:missing-module-on-known-paths>
 - <doc:module-version-missing>
 - <doc:module-not-testable>
@@ -107,6 +111,7 @@ Or upgrade all warnings except deprecated declaration to errors:
 - <doc:property-wrapper-requirements>
 - <doc:conformance-isolation>
 - <doc:protocol-type-non-conformance>
+- <doc:public-import-of-project-internal-module>
 - <doc:result-builder-methods>
 - <doc:spi-import-ignored>
 - <doc:semantic-copies>
@@ -121,6 +126,7 @@ Or upgrade all warnings except deprecated declaration to errors:
 - <doc:region-isolation-unknown-pattern>
 - <doc:unknown-warning-group>
 - <doc:unnecessary-effect-marker>
+- <doc:unnecessary-unsafe>
 - <doc:availability-unrecognized-name>
 - <doc:mutable-global-variable>
 - <doc:unsupported-scoped-import>
